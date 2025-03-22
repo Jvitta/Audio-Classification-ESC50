@@ -4,3 +4,9 @@ data/
 !.dvcignore
 
 mlruns/
+
+models/__pycache__/
+models/saved/
+__pycache__/
+*.py[cod]
+*$py.class

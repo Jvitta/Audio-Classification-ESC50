@@ -465,8 +465,20 @@ def main():
     # Choose the mode
     mode = args.mode
     
-    # Set up MLflow
-    experiment_name = "esc50_audio_classification"
+    # Set up MLflow with more specific experiment naming
+    if args.mode == 'cv':
+        experiment_name = "esc50_cross_validation"
+    elif args.mode == 'final':
+        experiment_name = "esc50_final_model"
+    else:
+        experiment_name = "esc50_audio_classification"
+
+    # You could also include configuration details in the experiment name
+    if args.config and os.path.exists(args.config):
+        config_name = os.path.splitext(os.path.basename(args.config))[0]
+        experiment_name = f"{experiment_name}_{config_name}"
+
+    # Create or get the experiment
     try:
         experiment_id = mlflow.create_experiment(experiment_name)
     except:
@@ -527,7 +539,7 @@ def main():
             
             plt.subplot(1, 2, 1)
             plt.plot(history['train_loss'], label='Train Loss')
-            plt.plot(history['val_loss'], label='Test Loss')
+            plt.plot(history['val_loss'], label='Validation Loss')
             plt.title('Loss Curves')
             plt.xlabel('Epoch')
             plt.ylabel('Loss')
@@ -535,7 +547,7 @@ def main():
             
             plt.subplot(1, 2, 2)
             plt.plot(history['train_acc'], label='Train Accuracy')
-            plt.plot(history['val_acc'], label='Test Accuracy')
+            plt.plot(history['val_acc'], label='Validation Accuracy')
             plt.title('Accuracy Curves')
             plt.xlabel('Epoch')
             plt.ylabel('Accuracy')
