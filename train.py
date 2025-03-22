@@ -10,6 +10,8 @@ from models.resnet import create_resnet18
 import json
 import time
 from datetime import datetime
+import mlflow
+import mlflow.pytorch
 
 def train_epoch(model, dataloader, criterion, optimizer, device):
     """
@@ -76,16 +78,16 @@ def validate(model, dataloader, criterion, device):
     
     return val_loss, val_acc, all_targets, all_predictions
 
-def train_single_fold(model, train_loader, val_loader, config, fold=None):
+def train_one_cv_split(model, train_loader, val_loader, config, fold=None):
     """
-    Train a model on a single fold
+    Train a model on one cross-validation split (multiple training folds, one validation fold)
     
     Args:
         model: PyTorch model
-        train_loader: Training data loader
-        val_loader: Validation data loader
+        train_loader: Training data loader (contains multiple folds)
+        val_loader: Validation data loader (contains one fold)
         config: Dictionary with training configuration
-        fold: Fold number (for logging)
+        fold: Fold number used for validation (for logging)
     
     Returns:
         trained model, training history, best validation accuracy
@@ -142,6 +144,16 @@ def train_single_fold(model, train_loader, val_loader, config, fold=None):
               f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, "
               f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
         
+        # Log metrics to MLflow
+        if mlflow.active_run():
+            metrics = {
+                f"train_loss{fold_str}": train_loss,
+                f"train_acc{fold_str}": train_acc,
+                f"val_loss{fold_str}": val_loss,
+                f"val_acc{fold_str}": val_acc
+            }
+            mlflow.log_metrics(metrics, step=epoch)
+        
         # Save best model
         if val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -185,12 +197,19 @@ def cross_validation(config, data_path, num_folds=4, test_fold=5):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
+    # Log dataset info to MLflow
+    if mlflow.active_run():
+        mlflow.log_param("dataset_path", data_path)
+        mlflow.log_param("num_samples", len(spectrograms))
+        mlflow.log_param("num_classes", len(np.unique(labels)))
+        mlflow.log_param("input_shape", spectrograms.shape[1:])
+    
     # Cross-validation loop
     for fold in range(1, num_folds + 1):
         print(f"\n--- Fold {fold} ---")
         
         # Create train/validation split based on folds
-        # The test_fold (typically fold 5) is completely excluded
+        # The test_fold (fold 5) is completely excluded
         val_indices = np.where(folds == fold)[0]
         train_indices = np.where((folds != fold) & (folds != test_fold))[0]
         
@@ -210,7 +229,7 @@ def cross_validation(config, data_path, num_folds=4, test_fold=5):
         model = create_resnet18(num_classes=len(np.unique(labels)))
         
         # Train on this fold
-        model, history, val_acc = train_single_fold(
+        model, history, val_acc = train_one_cv_split(
             model, train_loader, val_loader, config, fold=fold
         )
         
@@ -218,10 +237,19 @@ def cross_validation(config, data_path, num_folds=4, test_fold=5):
         fold_val_accs.append(val_acc)
         fold_histories.append(history)
         
+        # Log fold results to MLflow
+        if mlflow.active_run():
+            mlflow.log_metric(f"fold_{fold}_val_acc", val_acc)
+        
         # Save fold model if specified
         if config.get('save_fold_models', False):
             os.makedirs('models/saved', exist_ok=True)
-            torch.save(model.state_dict(), f'models/saved/model_fold_{fold}.pth')
+            model_path = f'models/saved/model_fold_{fold}.pth'
+            torch.save(model.state_dict(), model_path)
+            
+            # Log model to MLflow
+            if mlflow.active_run():
+                mlflow.pytorch.log_model(model, f"model_fold_{fold}")
     
     # Compute overall CV performance
     mean_val_acc = np.mean(fold_val_accs)
@@ -230,6 +258,11 @@ def cross_validation(config, data_path, num_folds=4, test_fold=5):
     print(f"\nCross-validation results:")
     print(f"Mean validation accuracy: {mean_val_acc:.4f} ± {std_val_acc:.4f}")
     print(f"Individual fold accuracies: {fold_val_accs}")
+    
+    # Log overall CV results to MLflow
+    if mlflow.active_run():
+        mlflow.log_metric("mean_val_acc", mean_val_acc)
+        mlflow.log_metric("std_val_acc", std_val_acc)
     
     cv_results = {
         'mean_val_acc': mean_val_acc,
@@ -288,7 +321,7 @@ def train_final_model(config, data_path, test_fold=5):
     
     # Train the model on all training data
     print("\n--- Training Final Model ---")
-    model, history, _ = train_single_fold(model, train_loader, test_loader, config)
+    model, history, _ = train_one_cv_split(model, train_loader, test_loader, config)
     
     # Evaluate on test set
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -298,6 +331,11 @@ def train_final_model(config, data_path, test_fold=5):
     print(f"\nFinal Test Results:")
     print(f"Test Accuracy: {test_acc:.4f}")
     print(f"Test Loss: {test_loss:.4f}")
+    
+    # Log test results to MLflow
+    if mlflow.active_run():
+        mlflow.log_metric("test_accuracy", test_acc)
+        mlflow.log_metric("test_loss", test_loss)
     
     # Generate classification report
     try:
@@ -313,8 +351,23 @@ def train_final_model(config, data_path, test_fold=5):
             target_names = None
             
         # Print classification report
+        report = classification_report(true_labels, predictions, target_names=target_names, output_dict=True)
         print("\nClassification Report:")
         print(classification_report(true_labels, predictions, target_names=target_names))
+        
+        # Log classification report to MLflow
+        if mlflow.active_run():
+            # Convert the report dict to metrics that MLflow can log
+            for class_label, metrics in report.items():
+                if isinstance(metrics, dict):  # Skip the averages
+                    for metric_name, value in metrics.items():
+                        mlflow.log_metric(f"{class_label}_{metric_name}", value)
+            
+            # Log average metrics
+            for avg_type in ['macro avg', 'weighted avg']:
+                if avg_type in report:
+                    for metric_name, value in report[avg_type].items():
+                        mlflow.log_metric(f"{avg_type.replace(' ', '_')}_{metric_name}", value)
     except Exception as e:
         print(f"Error generating classification report: {e}")
     
@@ -325,6 +378,11 @@ def train_final_model(config, data_path, test_fold=5):
     torch.save(model.state_dict(), model_path)
     print(f"Model saved to {model_path}")
     
+    # Log model to MLflow
+    if mlflow.active_run():
+        mlflow.pytorch.log_model(model, "final_model")
+        mlflow.log_artifact(model_path)
+    
     # Plot confusion matrix
     cm = confusion_matrix(true_labels, predictions)
     plt.figure(figsize=(10, 8))
@@ -334,7 +392,12 @@ def train_final_model(config, data_path, test_fold=5):
     plt.tight_layout()
     
     os.makedirs('visualizations', exist_ok=True)
-    plt.savefig(f'visualizations/confusion_matrix_{timestamp}.png')
+    cm_path = f'visualizations/confusion_matrix_{timestamp}.png'
+    plt.savefig(cm_path)
+    
+    # Log confusion matrix to MLflow
+    if mlflow.active_run():
+        mlflow.log_artifact(cm_path)
     
     # Save test results
     test_results = {
@@ -353,7 +416,7 @@ def main():
     # Configuration
     config = {
         'batch_size': 32,
-        'num_epochs': 50,
+        'num_epochs': 1,  # Set to 1 for initial testing
         'learning_rate': 0.001,
         'weight_decay': 1e-5,
         'use_lr_scheduler': True,
@@ -366,61 +429,87 @@ def main():
     # Choose the mode
     mode = 'cv'  # 'cv' for cross-validation, 'final' for final model training
     
-    if mode == 'cv':
-        # Perform cross-validation
-        _, cv_results = cross_validation(config, data_path)
+    # Set up MLflow
+    experiment_name = "esc50_audio_classification"
+    try:
+        experiment_id = mlflow.create_experiment(experiment_name)
+    except:
+        experiment_id = mlflow.get_experiment_by_name(experiment_name).experiment_id
+    
+    mlflow.set_experiment(experiment_name)
+    
+    # Start a new MLflow run
+    with mlflow.start_run(run_name=f"{mode}_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"):
+        # Log parameters
+        for key, value in config.items():
+            mlflow.log_param(key, value)
         
-        # Plot learning curves from cross-validation
-        plt.figure(figsize=(12, 5))
+        mlflow.log_param("mode", mode)
+        mlflow.log_param("device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         
-        plt.subplot(1, 2, 1)
-        for i, history in enumerate(cv_results['fold_histories']):
-            plt.plot(history['train_loss'], label=f'Fold {i+1} Train')
-            plt.plot(history['val_loss'], label=f'Fold {i+1} Val')
-        plt.title('Loss Curves')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend()
-        
-        plt.subplot(1, 2, 2)
-        for i, history in enumerate(cv_results['fold_histories']):
-            plt.plot(history['train_acc'], label=f'Fold {i+1} Train')
-            plt.plot(history['val_acc'], label=f'Fold {i+1} Val')
-        plt.title('Accuracy Curves')
-        plt.xlabel('Epoch')
-        plt.ylabel('Accuracy')
-        plt.legend()
-        
-        plt.tight_layout()
-        os.makedirs('visualizations', exist_ok=True)
-        plt.savefig('visualizations/cv_learning_curves.png')
-        
-    elif mode == 'final':
-        # Train final model
-        model, history, test_results = train_final_model(config, data_path)
-        
-        # Plot learning curves from final training
-        plt.figure(figsize=(12, 5))
-        
-        plt.subplot(1, 2, 1)
-        plt.plot(history['train_loss'], label='Train Loss')
-        plt.plot(history['val_loss'], label='Test Loss')
-        plt.title('Loss Curves')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend()
-        
-        plt.subplot(1, 2, 2)
-        plt.plot(history['train_acc'], label='Train Accuracy')
-        plt.plot(history['val_acc'], label='Test Accuracy')
-        plt.title('Accuracy Curves')
-        plt.xlabel('Epoch')
-        plt.ylabel('Accuracy')
-        plt.legend()
-        
-        plt.tight_layout()
-        os.makedirs('visualizations', exist_ok=True)
-        plt.savefig('visualizations/final_learning_curves.png')
+        if mode == 'cv':
+            # Perform cross-validation
+            _, cv_results = cross_validation(config, data_path)
+            
+            # Plot learning curves from cross-validation
+            plt.figure(figsize=(12, 5))
+            
+            plt.subplot(1, 2, 1)
+            for i, history in enumerate(cv_results['fold_histories']):
+                plt.plot(history['train_loss'], label=f'Fold {i+1} Train')
+                plt.plot(history['val_loss'], label=f'Fold {i+1} Val')
+            plt.title('Loss Curves')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.legend()
+            
+            plt.subplot(1, 2, 2)
+            for i, history in enumerate(cv_results['fold_histories']):
+                plt.plot(history['train_acc'], label=f'Fold {i+1} Train')
+                plt.plot(history['val_acc'], label=f'Fold {i+1} Val')
+            plt.title('Accuracy Curves')
+            plt.xlabel('Epoch')
+            plt.ylabel('Accuracy')
+            plt.legend()
+            
+            plt.tight_layout()
+            os.makedirs('visualizations', exist_ok=True)
+            curves_path = 'visualizations/cv_learning_curves.png'
+            plt.savefig(curves_path)
+            
+            # Log the learning curves to MLflow
+            mlflow.log_artifact(curves_path)
+            
+        elif mode == 'final':
+            # Train final model
+            model, history, test_results = train_final_model(config, data_path)
+            
+            # Plot learning curves from final training
+            plt.figure(figsize=(12, 5))
+            
+            plt.subplot(1, 2, 1)
+            plt.plot(history['train_loss'], label='Train Loss')
+            plt.plot(history['val_loss'], label='Test Loss')
+            plt.title('Loss Curves')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.legend()
+            
+            plt.subplot(1, 2, 2)
+            plt.plot(history['train_acc'], label='Train Accuracy')
+            plt.plot(history['val_acc'], label='Test Accuracy')
+            plt.title('Accuracy Curves')
+            plt.xlabel('Epoch')
+            plt.ylabel('Accuracy')
+            plt.legend()
+            
+            plt.tight_layout()
+            os.makedirs('visualizations', exist_ok=True)
+            curves_path = 'visualizations/final_learning_curves.png'
+            plt.savefig(curves_path)
+            
+            # Log the learning curves to MLflow
+            mlflow.log_artifact(curves_path)
 
 if __name__ == "__main__":
     start_time = time.time()
