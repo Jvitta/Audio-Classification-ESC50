@@ -16,6 +16,9 @@ import argparse
 from torch.utils.data import DataLoader, TensorDataset, SubsetRandomSampler
 from models.resnet import create_resnet18
 from torch_lr_finder import LRFinder
+import optuna
+from optuna.pruners import MedianPruner
+from optuna.samplers import TPESampler
 
 def grid_search(data_path, param_grid, num_folds=4, test_fold=5, epochs_per_config=10):
     """
@@ -535,6 +538,157 @@ def find_learning_rate(data_path, batch_size=32, test_fold=5, min_lr=1e-7, max_l
     
     return suggested_lr
 
+def bayesian_search(data_path, num_folds=4, test_fold=5, n_trials=25, timeout=None):
+    """
+    Perform Bayesian hyperparameter optimization using Optuna
+    
+    Args:
+        data_path: Path to preprocessed data
+        num_folds: Number of folds to use for cross-validation
+        test_fold: Fold to reserve for final testing
+        n_trials: Number of trials to run
+        timeout: Stop study after the given number of seconds (None means no timeout)
+    
+    Returns:
+        best_config: Configuration that achieved best validation performance
+        study: The completed Optuna study object
+    """
+    print("Starting Bayesian hyperparameter optimization...")
+    
+    # Set up MLflow experiment
+    experiment_name = "esc50_bayesian_optimization"
+    try:
+        experiment_id = mlflow.create_experiment(experiment_name)
+    except:
+        experiment_id = mlflow.get_experiment_by_name(experiment_name).experiment_id
+    
+    mlflow.set_experiment(experiment_name)
+    
+    # Define the objective function for Optuna
+    def objective(trial):
+        # Define hyperparameters to optimize
+        config = {
+            'batch_size': trial.suggest_categorical('batch_size', [4, 8, 16, 32]),
+            'learning_rate': 0.00018096,  # Fixed to the optimal value found by LR finder
+            'weight_decay': trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True),
+            'use_lr_scheduler': trial.suggest_categorical('use_lr_scheduler', [True, False]),
+            'num_epochs': 10  # Fixed for optimization
+        }
+        
+        # Optional: Add more hyperparameters for better tuning
+        if trial.suggest_categorical('use_dropout', [True, False]):
+            config['dropout_rate'] = trial.suggest_float('dropout_rate', 0.1, 0.5)
+        
+        # Optimize scheduling parameters if scheduler is used
+        if config['use_lr_scheduler']:
+            config['scheduler_patience'] = trial.suggest_int('scheduler_patience', 3, 10)
+            config['scheduler_factor'] = trial.suggest_float('scheduler_factor', 0.1, 0.5)
+        
+        # Add data augmentation parameters to test their impact
+        config['use_augmentation'] = trial.suggest_categorical('use_augmentation', [True, False])
+        if config['use_augmentation']:
+            config['aug_strength'] = trial.suggest_float('aug_strength', 0.1, 0.5)
+        
+        trial_id = trial.number
+        
+        # Track this configuration with MLflow
+        with mlflow.start_run(run_name=f"trial_{trial_id}"):
+            # Log parameters
+            for key, value in config.items():
+                mlflow.log_param(key, value)
+            
+            # Evaluate this configuration with cross-validation
+            _, cv_results = cross_validation(config, data_path, num_folds, test_fold)
+            
+            mean_val_acc = cv_results['mean_val_acc']
+            
+            # Log to MLflow
+            mlflow.log_metric("mean_val_acc", mean_val_acc)
+            mlflow.log_metric("std_val_acc", cv_results['std_val_acc'])
+            
+            # Report intermediate values for pruning
+            trial.report(mean_val_acc, step=1)
+            
+            # Handle pruning based on the intermediate value
+            if trial.should_prune():
+                raise optuna.exceptions.TrialPruned()
+            
+            return mean_val_acc
+    
+    # Create a study object and optimize the objective function
+    pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=0, interval_steps=1)
+    sampler = TPESampler(seed=42)  # Use TPE algorithm with a fixed seed for reproducibility
+    
+    study = optuna.create_study(
+        direction="maximize",  # We want to maximize validation accuracy
+        sampler=sampler,
+        pruner=pruner,
+        study_name="esc50_optimization"
+    )
+    
+    study.optimize(objective, n_trials=n_trials, timeout=timeout)
+    
+    print("\n===== Bayesian Optimization Results =====")
+    print(f"Best trial: {study.best_trial.number}")
+    print(f"Best validation accuracy: {study.best_value:.4f}")
+    print("Best hyperparameters:")
+    
+    # Create best config dictionary
+    best_config = study.best_params.copy()
+    
+    # Add some required keys that might not be in the params
+    if 'use_dropout' in best_config and best_config['use_dropout']:
+        # If dropout is enabled, keep the dropout rate
+        pass
+    else:
+        # Otherwise remove the dropout flag from the final config
+        if 'use_dropout' in best_config:
+            del best_config['use_dropout']
+    
+    # For final training, we want to use more epochs
+    best_config['num_epochs'] = 50
+    
+    # Additional scheduler parameters if present
+    scheduler_keys = ['scheduler_patience', 'scheduler_factor']
+    for key in scheduler_keys:
+        if key not in best_config and best_config.get('use_lr_scheduler', False):
+            if key == 'scheduler_patience':
+                best_config[key] = 5
+            elif key == 'scheduler_factor':
+                best_config[key] = 0.5
+    
+    print(json.dumps(best_config, indent=2))
+    
+    # Save best configuration for later use
+    os.makedirs('configs', exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    config_filename = f"bayesian_best_config_{timestamp}.json"
+    config_path = os.path.join('configs', config_filename)
+    
+    with open(config_path, 'w') as f:
+        json.dump(best_config, f, indent=2)
+    
+    # Also save a generic best_config.json for easy reference
+    with open(os.path.join('configs', 'bayesian_best_config.json'), 'w') as f:
+        json.dump(best_config, f, indent=2)
+    
+    # Save study statistics
+    try:
+        fig = optuna.visualization.plot_optimization_history(study)
+        fig.write_image('visualizations/bayesian_optimization_history.png')
+        
+        fig = optuna.visualization.plot_param_importances(study)
+        fig.write_image('visualizations/bayesian_param_importances.png')
+        
+        # Log to MLflow if in active run
+        if mlflow.active_run():
+            mlflow.log_artifact('visualizations/bayesian_optimization_history.png')
+            mlflow.log_artifact('visualizations/bayesian_param_importances.png')
+    except:
+        print("Warning: Could not create optimization visualizations. This may be due to missing plotly or other visualization dependencies.")
+    
+    return best_config, study
+
 def main():
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='Hyperparameter search for audio classification')
@@ -550,6 +704,12 @@ def main():
                       help='Number of iterations for LR finder (default: 100, higher values give smoother curves)')
     parser.add_argument('--batch-size', type=int, default=32,
                       help='Batch size for LR finder (default: 32)')
+    parser.add_argument('--bayesian', action='store_true',
+                      help='Use Bayesian optimization instead of grid search')
+    parser.add_argument('--n-trials', type=int, default=25,
+                      help='Number of trials for Bayesian optimization (default: 25)')
+    parser.add_argument('--timeout', type=int, default=None,
+                      help='Timeout in seconds for Bayesian optimization (default: None)')
     args = parser.parse_args()
     
     # Create baseline configs if requested
@@ -579,11 +739,23 @@ def main():
     # Data path
     data_path = 'data/preprocessed/esc50_preprocessed.npz'
     
-    # Define parameter grid to search
+    # Use Bayesian optimization if requested
+    if args.bayesian:
+        print("Using Bayesian optimization for hyperparameter search")
+        best_config, _ = bayesian_search(
+            data_path,
+            n_trials=args.n_trials,
+            timeout=args.timeout
+        )
+        print("\nTo train with the best configuration, run:")
+        print("python train.py --config configs/bayesian_best_config.json --mode final")
+        return
+    
+    # Define parameter grid to search (used if not using Bayesian optimization)
     param_grid = {
         'batch_size': [16, 32, 64],
-        'learning_rate': [0.01, 0.001, 0.0001],
-        'weight_decay': [1e-4, 1e-5, 0],
+        'learning_rate': [0.0002],  # Fixed to the optimal value found by LR finder
+        'weight_decay': [1e-6, 1e-5, 1e-4, 1e-3],
         'use_lr_scheduler': [True, False]
     }
     

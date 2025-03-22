@@ -27,7 +27,7 @@ class BasicBlock(nn.Module):
         return out
 
 class ResNet18ForAudio(nn.Module):
-    def __init__(self, num_classes=50, in_channels=1):
+    def __init__(self, num_classes=50, in_channels=1, dropout_rate=0.0):
         super(ResNet18ForAudio, self).__init__()
         """
         ResNet18 model adapted for audio spectrograms.
@@ -35,6 +35,7 @@ class ResNet18ForAudio(nn.Module):
         Args:
             num_classes (int): Number of output classes (default: 50 for ESC-50)
             in_channels (int): Number of input channels (default: 1 for mono audio)
+            dropout_rate (float): Dropout probability (default: 0.0 for no dropout)
         
         Input shape:
             (batch_size, 1, 64, 501) - (batch, channels, mel_bins, time_frames)
@@ -49,6 +50,10 @@ class ResNet18ForAudio(nn.Module):
         self.layer2 = self._make_layer(64, 128, 2, stride=2)
         self.layer3 = self._make_layer(128, 256, 2, stride=2)
         self.layer4 = self._make_layer(256, 512, 2, stride=2)
+        
+        # Dropout for regularization
+        self.dropout_rate = dropout_rate
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
         
         # Global average pooling and final classifier
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
@@ -89,22 +94,28 @@ class ResNet18ForAudio(nn.Module):
         # Global average pooling and classification
         x = self.avgpool(x)
         x = x.view(x.size(0), -1)
+        
+        # Apply dropout before the final fully connected layer
+        if self.dropout is not None:
+            x = self.dropout(x)
+            
         x = self.fc(x)
         
         return x
 
-def create_resnet18(num_classes=50, pretrained=False):
+def create_resnet18(num_classes=50, pretrained=False, dropout_rate=0.0):
     """
     Creates a ResNet18 model for audio classification.
     
     Args:
         num_classes (int): Number of output classes
         pretrained (bool): Flag for using pretrained weights (not implemented yet)
+        dropout_rate (float): Dropout probability for regularization (default: 0.0)
     
     Returns:
         model: The ResNet18 model
     """
-    model = ResNet18ForAudio(num_classes=num_classes)
+    model = ResNet18ForAudio(num_classes=num_classes, dropout_rate=dropout_rate)
     
     if pretrained:
         # Future implementation could load pretrained weights

@@ -13,6 +13,7 @@ from datetime import datetime
 import mlflow
 import mlflow.pytorch
 import argparse
+import random
 
 def train_epoch(model, dataloader, criterion, optimizer, device):
     """
@@ -107,8 +108,16 @@ def train_one_cv_split(model, train_loader, val_loader, config, fold=None):
     
     # Learning rate scheduler
     if config.get('use_lr_scheduler', False):
+        # Get scheduler parameters from config if available
+        scheduler_patience = config.get('scheduler_patience', 5)
+        scheduler_factor = config.get('scheduler_factor', 0.5)
+        
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=5
+            optimizer, 
+            mode='min', 
+            factor=scheduler_factor, 
+            patience=scheduler_patience,
+            verbose=True
         )
         # Store initial learning rate for comparison
         prev_lr = [group['lr'] for group in optimizer.param_groups]
@@ -174,6 +183,61 @@ def train_one_cv_split(model, train_loader, val_loader, config, fold=None):
     
     return model, history, best_val_acc
 
+class AugmentedDataset(TensorDataset):
+    """
+    Dataset wrapper that applies augmentation to spectrograms
+    """
+    def __init__(self, spectrograms, labels, use_augmentation=False, aug_strength=0.3):
+        super(AugmentedDataset, self).__init__(spectrograms, labels)
+        self.use_augmentation = use_augmentation
+        self.aug_strength = aug_strength
+    
+    def __getitem__(self, index):
+        spectrogram, label = super(AugmentedDataset, self).__getitem__(index)
+        
+        if self.use_augmentation and random.random() < 0.5:  # 50% chance to apply augmentation
+            # Apply augmentation to the spectrogram
+            spectrogram = self._augment_spectrogram(spectrogram)
+        
+        return spectrogram, label
+    
+    def _augment_spectrogram(self, spectrogram):
+        """Apply augmentation to a single spectrogram tensor"""
+        # Make a copy to avoid modifying the original
+        aug_spec = spectrogram.clone()
+        
+        # Get dimensions (1, height, width)
+        C, H, W = aug_spec.shape
+        
+        # Time shift: move the spectrogram left or right by a small amount
+        if random.random() < 0.5:
+            shift_amount = int(W * self.aug_strength * random.uniform(0.1, 1.0))
+            if random.random() < 0.5:  # Shift left
+                aug_spec[:, :, shift_amount:] = aug_spec[:, :, :-shift_amount]
+                aug_spec[:, :, :shift_amount] = 0
+            else:  # Shift right
+                aug_spec[:, :, :-shift_amount] = aug_spec[:, :, shift_amount:]
+                aug_spec[:, :, -shift_amount:] = 0
+        
+        # Frequency masking: mask some frequency bands
+        if random.random() < 0.5:
+            mask_height = int(H * self.aug_strength * random.uniform(0.1, 0.5))
+            mask_start = random.randint(0, H - mask_height)
+            aug_spec[:, mask_start:mask_start+mask_height, :] = 0
+        
+        # Time masking: mask some time steps
+        if random.random() < 0.5:
+            mask_width = int(W * self.aug_strength * random.uniform(0.1, 0.3))
+            mask_start = random.randint(0, W - mask_width)
+            aug_spec[:, :, mask_start:mask_start+mask_width] = 0
+        
+        # Magnitude perturbation: randomly adjust the magnitudes
+        if random.random() < 0.5:
+            magnitude_factor = 1.0 + random.uniform(-self.aug_strength, self.aug_strength)
+            aug_spec = aug_spec * magnitude_factor
+        
+        return aug_spec
+
 def cross_validation(config, data_path, num_folds=4, test_fold=5):
     """
     Perform cross-validation training
@@ -198,8 +262,17 @@ def cross_validation(config, data_path, num_folds=4, test_fold=5):
     spectrograms_tensor = torch.tensor(spectrograms, dtype=torch.float32).unsqueeze(1)  # Add channel dimension
     labels_tensor = torch.tensor(labels, dtype=torch.long)
     
-    # Prepare dataset
-    dataset = TensorDataset(spectrograms_tensor, labels_tensor)
+    # Get augmentation settings from config
+    use_augmentation = config.get('use_augmentation', False)
+    aug_strength = config.get('aug_strength', 0.3)
+    
+    # Prepare dataset with optional augmentation
+    dataset = AugmentedDataset(
+        spectrograms_tensor, 
+        labels_tensor,
+        use_augmentation=use_augmentation,
+        aug_strength=aug_strength
+    )
     
     # Track results across folds
     fold_val_accs = []
@@ -213,6 +286,11 @@ def cross_validation(config, data_path, num_folds=4, test_fold=5):
         mlflow.log_param("num_samples", len(spectrograms))
         mlflow.log_param("num_classes", len(np.unique(labels)))
         mlflow.log_param("input_shape", spectrograms.shape[1:])
+        if use_augmentation:
+            mlflow.log_param("augmentation", "enabled")
+            mlflow.log_param("aug_strength", aug_strength)
+        else:
+            mlflow.log_param("augmentation", "disabled")
     
     # Cross-validation loop
     for fold in range(1, num_folds + 1):
@@ -235,8 +313,9 @@ def cross_validation(config, data_path, num_folds=4, test_fold=5):
             dataset, batch_size=config['batch_size'], sampler=val_sampler
         )
         
-        # Create model
-        model = create_resnet18(num_classes=len(np.unique(labels)))
+        # Create model, with optional dropout support
+        dropout_rate = config.get('dropout_rate', 0.0)  # Default to 0 (no dropout)
+        model = create_resnet18(num_classes=len(np.unique(labels)), dropout_rate=dropout_rate)
         
         # Train on this fold
         model, history, val_acc = train_one_cv_split(
@@ -307,8 +386,17 @@ def train_final_model(config, data_path, test_fold=5):
     spectrograms_tensor = torch.tensor(spectrograms, dtype=torch.float32).unsqueeze(1)
     labels_tensor = torch.tensor(labels, dtype=torch.long)
     
-    # Prepare dataset
-    dataset = TensorDataset(spectrograms_tensor, labels_tensor)
+    # Get augmentation settings from config
+    use_augmentation = config.get('use_augmentation', False)
+    aug_strength = config.get('aug_strength', 0.3)
+    
+    # Prepare dataset with optional augmentation
+    dataset = AugmentedDataset(
+        spectrograms_tensor, 
+        labels_tensor,
+        use_augmentation=use_augmentation,
+        aug_strength=aug_strength
+    )
     
     # Create train/test split
     train_indices = np.where(folds != test_fold)[0]
@@ -326,8 +414,9 @@ def train_final_model(config, data_path, test_fold=5):
         dataset, batch_size=config['batch_size'], sampler=test_sampler
     )
     
-    # Create model
-    model = create_resnet18(num_classes=len(np.unique(labels)))
+    # Create model with optional dropout
+    dropout_rate = config.get('dropout_rate', 0.0)  # Default to 0 (no dropout)
+    model = create_resnet18(num_classes=len(np.unique(labels)), dropout_rate=dropout_rate)
     
     # Train the model on all training data
     print("\n--- Training Final Model ---")
