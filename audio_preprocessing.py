@@ -7,12 +7,20 @@ import os
 import json
 from datetime import datetime
 
-def extract_spectrogram(audio_data, sr, n_mels=128):
+def extract_spectrogram(audio_data, sr, n_mels=64):
+    # Calculate window size and hop length in samples
+    win_length = int(0.025 * sr)  # 25ms window
+    hop_length = int(0.010 * sr)  # 10ms hop
+    n_fft = win_length 
+    
     # Create mel spectrogram
     mel_spect = librosa.feature.melspectrogram(
         y=audio_data,
         sr=sr,
         n_mels=n_mels,
+        n_fft=n_fft,
+        win_length=win_length,
+        hop_length=hop_length,
         fmax=sr/2
     )
     
@@ -53,8 +61,7 @@ def preprocess_dataset(data_dir, metadata_path, save_dir='data/preprocessed'):
     
     Returns:
         spectrograms (np.array): Array of normalized mel spectrograms
-        labels_numeric (np.array): Array of numeric labels [0-49]
-        labels_categorical (list): List of categorical labels
+        labels (np.array): Array of numeric labels [0-49]
         folds (np.array): Array of fold numbers for cross-validation
     """
     # Create save directory if it doesn't exist
@@ -63,9 +70,13 @@ def preprocess_dataset(data_dir, metadata_path, save_dir='data/preprocessed'):
     # Load metadata
     metadata = pd.read_csv(metadata_path)
     
+    # Create label mapping based on actual target-category pairs
+    label_mapping = metadata[['target', 'category']].drop_duplicates().set_index('target')['category'].to_dict()
+    with open(os.path.join(save_dir, 'label_mapping.json'), 'w') as f:
+        json.dump(label_mapping, f, indent=4)
+    
     spectrograms = []
-    labels_numeric = []
-    labels_categorical = []
+    labels = []
     folds = []
     
     for idx, row in metadata.iterrows():
@@ -83,8 +94,7 @@ def preprocess_dataset(data_dir, metadata_path, save_dir='data/preprocessed'):
             norm_spec = normalize_spectrogram(spec)
             
             spectrograms.append(norm_spec)
-            labels_numeric.append(row['target'])
-            labels_categorical.append(row['category'])
+            labels.append(row['target'])
             folds.append(row['fold'])
             
         except Exception as e:
@@ -93,15 +103,14 @@ def preprocess_dataset(data_dir, metadata_path, save_dir='data/preprocessed'):
     
     # Convert lists to numpy arrays
     spectrograms = np.array(spectrograms)
-    labels_numeric = np.array(labels_numeric)
+    labels = np.array(labels)
     folds = np.array(folds)
     
     # Save preprocessed data
     np.savez(
         os.path.join(save_dir, 'esc50_preprocessed.npz'),
         spectrograms=spectrograms,
-        labels_numeric=labels_numeric,
-        labels_categorical=labels_categorical,
+        labels=labels,
         folds=folds
     )
     
@@ -109,22 +118,22 @@ def preprocess_dataset(data_dir, metadata_path, save_dir='data/preprocessed'):
     preprocessing_info = {
         'num_samples': len(spectrograms),
         'spectrogram_shape': spectrograms[0].shape,
-        'num_classes': len(np.unique(labels_numeric)),
-        'class_distribution': pd.Series(labels_categorical).value_counts().to_dict(),
+        'num_classes': len(np.unique(labels)),
+        'class_distribution': {label_mapping[k]: v for k, v in pd.Series(labels).value_counts().to_dict().items()},
         'preprocessing_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     }
     
     with open(os.path.join(save_dir, 'preprocessing_info.json'), 'w') as f:
         json.dump(preprocessing_info, f, indent=4)
     
-    return spectrograms, labels_numeric, labels_categorical, folds
+    return spectrograms, labels, folds
 
 if __name__ == "__main__":
     data_dir = "data/audio"
     metadata_path = "data/meta/esc50.csv"
     save_dir = "data/preprocessed"
     
-    spectrograms, labels_numeric, labels_categorical, folds = preprocess_dataset(
+    spectrograms, labels, folds = preprocess_dataset(
         data_dir, metadata_path, save_dir
     )
     print(f"Preprocessed data saved to {save_dir}")
