@@ -3,6 +3,9 @@ import librosa.display
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import os
+import json
+from datetime import datetime
 
 def extract_spectrogram(audio_data, sr, n_mels=128):
     # Create mel spectrogram
@@ -17,7 +20,7 @@ def extract_spectrogram(audio_data, sr, n_mels=128):
     mel_spect_db = librosa.power_to_db(mel_spect, ref=np.max)
     return mel_spect_db
 
-def load_audio_signal(file_path, sr=22050):
+def load_audio_signal(file_path, sr=44100):
     # Load audio file
     audio_data, sr = librosa.load(file_path, sr=sr)
     return audio_data, sr
@@ -39,19 +42,93 @@ def normalize_spectrogram(spectrogram):
     normalized = (spectrogram - min_val) / (max_val - min_val)
     return normalized
 
-def extract_features(audio_data, sr):
-    features = {}
+def preprocess_dataset(data_dir, metadata_path, save_dir='data/preprocessed'):
+    """
+    Prepare and save the ESC-50 dataset for training.
     
-    # Mel-frequency cepstral coefficients
-    mfccs = librosa.feature.mfcc(y=audio_data, sr=sr, n_mfcc=13)
-    features['mfcc'] = np.mean(mfccs.T, axis=0)
+    Args:
+        data_dir (str): Directory containing the audio files
+        metadata_path (str): Path to the esc50.csv metadata file
+        save_dir (str): Directory to save preprocessed data
     
-    # Spectral centroid
-    spectral_centroids = librosa.feature.spectral_centroid(y=audio_data, sr=sr)[0]
-    features['spectral_centroid'] = np.mean(spectral_centroids)
+    Returns:
+        spectrograms (np.array): Array of normalized mel spectrograms
+        labels_numeric (np.array): Array of numeric labels [0-49]
+        labels_categorical (list): List of categorical labels
+        folds (np.array): Array of fold numbers for cross-validation
+    """
+    # Create save directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
     
-    # Zero crossing rate
-    zcr = librosa.feature.zero_crossing_rate(audio_data)[0]
-    features['zcr'] = np.mean(zcr)
+    # Load metadata
+    metadata = pd.read_csv(metadata_path)
     
-    return features
+    spectrograms = []
+    labels_numeric = []
+    labels_categorical = []
+    folds = []
+    
+    for idx, row in metadata.iterrows():
+        try:
+            # Load audio
+            audio_path = f"{data_dir}/{row['filename']}"
+            audio_data, sr = load_audio_signal(audio_path)
+            
+            # Pad audio - ESC-50 files are 5 seconds at 44.1kHz
+            target_length = int(5 * sr)  # 5 seconds * 44100 Hz
+            padded_audio = pad_audio(audio_data, target_length)
+            
+            # Extract and normalize spectrogram
+            spec = extract_spectrogram(padded_audio, sr)
+            norm_spec = normalize_spectrogram(spec)
+            
+            spectrograms.append(norm_spec)
+            labels_numeric.append(row['target'])
+            labels_categorical.append(row['category'])
+            folds.append(row['fold'])
+            
+        except Exception as e:
+            print(f"Error processing file {row['filename']}: {str(e)}")
+            continue
+    
+    # Convert lists to numpy arrays
+    spectrograms = np.array(spectrograms)
+    labels_numeric = np.array(labels_numeric)
+    folds = np.array(folds)
+    
+    # Save preprocessed data
+    np.savez(
+        os.path.join(save_dir, 'esc50_preprocessed.npz'),
+        spectrograms=spectrograms,
+        labels_numeric=labels_numeric,
+        labels_categorical=labels_categorical,
+        folds=folds
+    )
+    
+    # Save metadata about the preprocessing
+    preprocessing_info = {
+        'num_samples': len(spectrograms),
+        'spectrogram_shape': spectrograms[0].shape,
+        'num_classes': len(np.unique(labels_numeric)),
+        'class_distribution': pd.Series(labels_categorical).value_counts().to_dict(),
+        'preprocessing_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    }
+    
+    with open(os.path.join(save_dir, 'preprocessing_info.json'), 'w') as f:
+        json.dump(preprocessing_info, f, indent=4)
+    
+    return spectrograms, labels_numeric, labels_categorical, folds
+
+if __name__ == "__main__":
+    data_dir = "data/audio"
+    metadata_path = "data/meta/esc50.csv"
+    save_dir = "data/preprocessed"
+    
+    spectrograms, labels_numeric, labels_categorical, folds = preprocess_dataset(
+        data_dir, metadata_path, save_dir
+    )
+    print(f"Preprocessed data saved to {save_dir}")
+    print(f"Spectrogram shape: {spectrograms.shape}")
+    
+
+
