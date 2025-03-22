@@ -3,13 +3,19 @@ import numpy as np
 import itertools
 import json
 import torch
+import torch.nn as nn
+import torch.optim as optim
 import time
 from datetime import datetime
 import matplotlib.pyplot as plt
 import mlflow
 import mlflow.pytorch
 from train import cross_validation
+import train
 import argparse
+from torch.utils.data import DataLoader, TensorDataset, SubsetRandomSampler
+from models.resnet import create_resnet18
+from torch_lr_finder import LRFinder
 
 def grid_search(data_path, param_grid, num_folds=4, test_fold=5, epochs_per_config=10):
     """
@@ -206,16 +212,368 @@ def save_baseline_configs():
     print("  - configs/baseline_config.json (5 epochs, for development)")
     print("  - configs/production_config.json (50 epochs, for final training)")
 
+def get_optimal_lr(lr_finder):
+    """
+    Get the optimal learning rate from the lr_finder history.
+    This is a replacement for the non-existent suggestion() method.
+    
+    The approach finds the point with the steepest downward slope
+    in the loss vs. learning rate curve.
+    
+    Args:
+        lr_finder: The LRFinder object after running range_test
+        
+    Returns:
+        float: The suggested optimal learning rate
+    """
+    lrs = lr_finder.history["lr"]
+    losses = lr_finder.history["loss"]
+    
+    # Handle empty history
+    if not lrs or not losses:
+        print("Warning: Empty learning rate history. Using default learning rate.")
+        return 1e-3
+    
+    # Skip the beginning and end of the curve for more stable results
+    skip_start = min(10, len(lrs) // 10)
+    skip_end = min(5, len(lrs) // 20)
+    
+    if skip_start >= len(lrs) or skip_end >= len(lrs) or skip_start + skip_end >= len(lrs):
+        # If not enough data points, use a simpler approach
+        if len(lrs) > 3:
+            min_loss_idx = losses.index(min(losses))
+            # Return the learning rate at minimum loss or slightly before
+            return lrs[max(0, min_loss_idx - 1)]
+        return lrs[0] if lrs else 1e-3  # Default if no data
+    
+    # Calculate gradients with safeguards for division by zero
+    gradients = []
+    for i in range(skip_start, len(lrs) - skip_end - 1):
+        lr_diff = lrs[i + 1] - lrs[i]
+        if abs(lr_diff) < 1e-10:  # Avoid division by near-zero
+            continue
+        gradients.append((losses[i + 1] - losses[i]) / lr_diff)
+    
+    # Check if we have valid gradients
+    if not gradients:
+        print("Warning: Could not calculate valid gradients. Using median learning rate.")
+        return lrs[len(lrs) // 2]
+    
+    # Find the point with the steepest negative gradient
+    # (use smoothed gradient to avoid noise)
+    smooth_window = min(5, len(gradients) // 5)
+    if smooth_window > 0 and len(gradients) > smooth_window:
+        smoothed_gradients = []
+        for i in range(len(gradients) - smooth_window + 1):
+            smoothed_gradients.append(sum(gradients[i:i+smooth_window]) / smooth_window)
+        
+        if not smoothed_gradients:
+            # If we somehow ended up with no smoothed gradients
+            steepest_idx = gradients.index(min(gradients))
+        else:
+            steepest_idx = smoothed_gradients.index(min(smoothed_gradients))
+    else:
+        steepest_idx = gradients.index(min(gradients))
+    
+    # Return the learning rate at the steepest point
+    suggested_lr = lrs[skip_start + steepest_idx]
+    
+    return suggested_lr
+
+def find_learning_rate(data_path, batch_size=32, test_fold=5, min_lr=1e-7, max_lr=10, num_iter=100):
+    """
+    Use the LR Finder to discover the optimal learning rate for the model.
+    Uses k-fold cross-validation to get a more robust estimate.
+    
+    Args:
+        data_path: Path to preprocessed data
+        batch_size: Batch size to use for training
+        test_fold: Fold to reserve for final testing
+        min_lr: Minimum learning rate to explore
+        max_lr: Maximum learning rate to explore
+        num_iter: Number of iterations for the LR finder
+    
+    Returns:
+        suggested_lr: The suggested learning rate based on the finder
+    """
+    print("Starting Learning Rate Finder with cross-validation...")
+    
+    # Set up MLflow if available
+    try:
+        experiment_name = "esc50_learning_rate_finder"
+        try:
+            experiment_id = mlflow.create_experiment(experiment_name)
+        except:
+            experiment_id = mlflow.get_experiment_by_name(experiment_name).experiment_id
+        
+        mlflow.set_experiment(experiment_name)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_id = mlflow.start_run(run_name=f"lr_finder_cv_{timestamp}").info.run_id
+    except Exception as e:
+        print(f"Warning: Could not set up MLflow: {e}")
+        run_id = None
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Now we'll create a temporary wrapper that will override the train_one_cv_split 
+    # function from train module with our LR finder version
+    original_train_one_cv_split = getattr(train, 'train_one_cv_split')
+    
+    # Track results across folds
+    suggested_lrs = []
+    fold_ranges = []
+    
+    # Define the custom training function that will replace train_one_cv_split
+    def lr_finder_train_split(model, train_loader, val_loader, config, fold=None):
+        """
+        Override the regular training with LR finder
+        """
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
+        
+        # Initialize optimizer and loss
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(model.parameters(), lr=1e-5, weight_decay=1e-5)
+        
+        # Initialize LR Finder
+        lr_finder = LRFinder(model, optimizer, criterion, device=device)
+        
+        # Run LR Finder
+        print(f"Running LR Finder for fold {fold} from {min_lr} to {max_lr} over {num_iter} iterations...")
+        lr_finder.range_test(train_loader, val_loader=val_loader, end_lr=max_lr, num_iter=num_iter, step_mode="exp")
+        
+        # Get suggestion for this fold
+        fold_suggested_lr = get_optimal_lr(lr_finder)
+        suggested_lrs.append(fold_suggested_lr)
+        print(f"Fold {fold} suggested learning rate: {fold_suggested_lr:.8f}")
+        
+        # Store min/max boundaries of the good LR range for this fold
+        losses = lr_finder.history["loss"]
+        lrs = lr_finder.history["lr"]
+        
+        # Find the range where loss is decreasing
+        smooth_f = 0.05  # Smoothing factor for loss curve
+        smooth_losses = []
+        avg_loss = 0
+        for loss in losses:
+            avg_loss = smooth_f * loss + (1 - smooth_f) * avg_loss
+            smooth_losses.append(avg_loss)
+        
+        # Find the point of steepest decline
+        derivatives = []
+        valid_range_found = False
+        
+        try:
+            for i in range(1, len(lrs)):
+                if abs(lrs[i] - lrs[i-1]) < 1e-10:  # Avoid division by near-zero
+                    continue
+                derivatives.append((smooth_losses[i] - smooth_losses[i-1]) / (lrs[i] - lrs[i-1]))
+            
+            if derivatives:
+                # Find the min LR where loss starts decreasing significantly
+                min_idx = 10  # Skip first few points
+                if min_idx < len(derivatives) - 5:
+                    for i in range(min_idx, len(derivatives) - 5):
+                        if derivatives[i] < -0.5:  # Threshold for significant decrease
+                            min_idx = i
+                            break
+                    
+                    # Find the max LR where loss starts increasing again
+                    max_idx = len(derivatives) - 5
+                    for i in range(min_idx, len(derivatives) - 5):
+                        if derivatives[i] > 0:  # Loss starts increasing
+                            max_idx = i
+                            break
+                    
+                    fold_range = (lrs[min_idx], lrs[max_idx])
+                    fold_ranges.append(fold_range)
+                    valid_range_found = True
+        except Exception as e:
+            print(f"Warning: Error calculating learning rate range: {e}")
+        
+        # If we couldn't determine a valid range, use a default range around the suggested LR
+        if not valid_range_found:
+            print(f"Could not determine a valid learning rate range for fold {fold}. Using default range.")
+            fold_range = (fold_suggested_lr / 10, fold_suggested_lr * 10)
+            fold_ranges.append(fold_range)
+        
+        # Plot for this fold
+        try:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            lr_finder.plot(ax=ax, skip_start=10, skip_end=5)
+            ax.set_title(f'Fold {fold} Learning Rate Finder (Suggested LR: {fold_suggested_lr:.8f})')
+            ax.set_xlabel('Learning Rate')
+            ax.set_ylabel('Loss')
+            ax.axvline(x=fold_suggested_lr, color='r', linestyle='--', alpha=0.7)
+            ax.axvline(x=fold_range[0], color='g', linestyle='--', alpha=0.5)
+            ax.axvline(x=fold_range[1], color='y', linestyle='--', alpha=0.5)
+            
+            # Save the fold plot
+            os.makedirs('visualizations', exist_ok=True)
+            fold_lr_plot_path = f'visualizations/lr_finder_fold_{fold}_{timestamp}.png'
+            plt.savefig(fold_lr_plot_path)
+            plt.close()
+            
+            # Log to MLflow
+            if run_id:
+                try:
+                    mlflow.log_metric(f"fold_{fold}_suggested_lr", fold_suggested_lr)
+                    mlflow.log_artifact(fold_lr_plot_path)
+                except Exception as e:
+                    print(f"Warning: Could not log to MLflow: {e}")
+        except Exception as e:
+            print(f"Warning: Error creating learning rate plot: {e}")
+        
+        # Instead of returning a trained model, we return a dummy model
+        # This is OK since we're not using the CV results for actual training
+        return model, {}, 0.0  # Return dummy history and acc - we don't use them
+    
+    # Temporarily replace the training function with our LR finder version
+    setattr(train, 'train_one_cv_split', lr_finder_train_split)
+    
+    # Create a config that matches what cross_validation expects
+    config = {
+        'batch_size': batch_size,
+        'num_epochs': 1,  # Not used for LR finding
+        'learning_rate': 1e-5,  # Not used for LR finding
+        'weight_decay': 1e-5,  # Will be used in the Adam optimizer
+        'use_lr_scheduler': False  # Not needed for LR finding
+    }
+    
+    # Run cross-validation which will use our modified training function
+    try:
+        # Suppress normal CV output
+        import sys
+        from io import StringIO
+        old_stdout = sys.stdout
+        sys.stdout = mystdout = StringIO()
+        
+        _, _ = train.cross_validation(config, data_path, num_folds=4, test_fold=test_fold)
+        
+        # Restore stdout
+        sys.stdout = old_stdout
+    finally:
+        # Restore the original training function no matter what
+        setattr(train, 'train_one_cv_split', original_train_one_cv_split)
+    
+    # Compute final suggested learning rate (geometric mean of fold suggestions)
+    suggested_lr = np.exp(np.mean(np.log(suggested_lrs)))
+    print(f"\nFinal suggested learning rate (geometric mean): {suggested_lr:.8f}")
+    
+    # Also calculate range intersection
+    if fold_ranges:
+        min_lr_range = max([r[0] for r in fold_ranges])
+        max_lr_range = min([r[1] for r in fold_ranges])
+        
+        # Check if the range is valid
+        if min_lr_range <= max_lr_range:
+            print(f"Common learning rate range across folds: {min_lr_range:.8f} to {max_lr_range:.8f}")
+        else:
+            print("No common learning rate range found across folds. Using suggested learning rate only.")
+            min_lr_range = suggested_lr / 10
+            max_lr_range = suggested_lr * 10
+    else:
+        print("No valid learning rate ranges found. Using suggested learning rate and default range.")
+        min_lr_range = suggested_lr / 10
+        max_lr_range = suggested_lr * 10
+    
+    # Create a summary plot of all fold suggestions
+    plt.figure(figsize=(10, 6))
+    for i, lr in enumerate(suggested_lrs):
+        plt.axvline(x=lr, color=f'C{i}', linestyle='--', alpha=0.7, label=f'Fold {i+1}: {lr:.8f}')
+    
+    plt.axvline(x=suggested_lr, color='r', linestyle='-', linewidth=2, label=f'Final: {suggested_lr:.8f}')
+    plt.axvspan(min_lr_range, max_lr_range, alpha=0.1, color='green', label='Common range')
+    
+    plt.xscale('log')
+    plt.grid(True, which="both", ls="-", alpha=0.2)
+    plt.xlabel('Learning Rate')
+    plt.title('Learning Rate Suggestions Across Folds')
+    plt.legend()
+    
+    summary_plot_path = f'visualizations/lr_finder_summary_{timestamp}.png'
+    plt.savefig(summary_plot_path)
+    plt.close()
+    
+    # Save the suggested learning rate to a config file
+    lr_config = {
+        'batch_size': batch_size,
+        'learning_rate': suggested_lr,
+        'weight_decay': 1e-5,
+        'use_lr_scheduler': True,
+        'num_epochs': 50
+    }
+    
+    os.makedirs('configs', exist_ok=True)
+    config_path = os.path.join('configs', f'lr_finder_config_{timestamp}.json')
+    with open(config_path, 'w') as f:
+        json.dump(lr_config, f, indent=2)
+    
+    print(f"Configuration with suggested learning rate saved to {config_path}")
+    
+    # Also save to a standard name for easy reference
+    standard_config_path = os.path.join('configs', 'lr_finder_config.json')
+    with open(standard_config_path, 'w') as f:
+        json.dump(lr_config, f, indent=2)
+    
+    print(f"Configuration also saved to {standard_config_path}")
+    
+    # Log to MLflow if available
+    if run_id:
+        try:
+            mlflow.log_metric("suggested_lr", suggested_lr)
+            mlflow.log_metric("min_lr_range", min_lr_range)
+            mlflow.log_metric("max_lr_range", max_lr_range)
+            mlflow.log_artifact(summary_plot_path)
+            mlflow.log_artifact(config_path)
+        except Exception as e:
+            print(f"Warning: Could not log to MLflow: {e}")
+            
+        try:
+            mlflow.end_run()
+        except:
+            pass
+    
+    return suggested_lr
+
 def main():
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='Hyperparameter search for audio classification')
     parser.add_argument('--create-baseline-configs', action='store_true',
                       help='Create baseline configuration files without running search')
+    parser.add_argument('--find-lr', action='store_true',
+                      help='Run learning rate finder to determine optimal learning rate range')
+    parser.add_argument('--min-lr', type=float, default=1e-7,
+                      help='Minimum learning rate to explore (default: 1e-7)')
+    parser.add_argument('--max-lr', type=float, default=10.0,
+                      help='Maximum learning rate to explore (default: 10.0)')
+    parser.add_argument('--num-iter', type=int, default=100,
+                      help='Number of iterations for LR finder (default: 100, higher values give smoother curves)')
+    parser.add_argument('--batch-size', type=int, default=32,
+                      help='Batch size for LR finder (default: 32)')
     args = parser.parse_args()
     
     # Create baseline configs if requested
     if args.create_baseline_configs:
         save_baseline_configs()
+        return
+    
+    # Run learning rate finder if requested
+    if args.find_lr:
+        print(f"Starting learning rate finder with batch size {args.batch_size}")
+        print(f"Learning rate range: {args.min_lr} to {args.max_lr} over {args.num_iter} iterations")
+        try:
+            suggested_lr = find_learning_rate(
+                'data/preprocessed/esc50_preprocessed.npz',
+                batch_size=args.batch_size,
+                min_lr=args.min_lr,
+                max_lr=args.max_lr,
+                num_iter=args.num_iter
+            )
+            print(f"Learning rate finder completed successfully!")
+            print(f"Suggested learning rate: {suggested_lr:.8f}")
+            print(f"Configuration saved to configs/lr_finder_config.json")
+        except Exception as e:
+            print(f"Error running learning rate finder: {e}")
         return
     
     # Data path
