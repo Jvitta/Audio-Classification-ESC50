@@ -1,0 +1,17 @@
+name: audio-classification
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - matplotlib
+  - scikit-learn
+  - librosa
+  - jupyter
+  - libsndfile
+  - pip
+  - pip:
+    - soundfile
+    - audioread
