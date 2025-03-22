@@ -12,6 +12,7 @@ import time
 from datetime import datetime
 import mlflow
 import mlflow.pytorch
+import argparse
 
 def train_epoch(model, dataloader, criterion, optimizer, device):
     """
@@ -107,8 +108,10 @@ def train_one_cv_split(model, train_loader, val_loader, config, fold=None):
     # Learning rate scheduler
     if config.get('use_lr_scheduler', False):
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=5, verbose=True
+            optimizer, mode='min', factor=0.5, patience=5
         )
+        # Store initial learning rate for comparison
+        prev_lr = [group['lr'] for group in optimizer.param_groups]
     
     # Training history
     history = {
@@ -120,6 +123,7 @@ def train_one_cv_split(model, train_loader, val_loader, config, fold=None):
     best_model_state = None
     
     fold_str = f" (Fold {fold})" if fold is not None else ""
+    mlflow_fold_str = f"_fold_{fold}" if fold is not None else ""
     print(f"Starting training{fold_str}...")
     
     for epoch in range(num_epochs):
@@ -132,6 +136,12 @@ def train_one_cv_split(model, train_loader, val_loader, config, fold=None):
         # Update learning rate if using scheduler
         if config.get('use_lr_scheduler', False):
             scheduler.step(val_loss)
+            
+            # Check if learning rate changed
+            current_lr = [group['lr'] for group in optimizer.param_groups]
+            if current_lr != prev_lr:
+                print(f"Learning rate adjusted from {prev_lr[0]:.6f} to {current_lr[0]:.6f}")
+                prev_lr = current_lr
         
         # Save history
         history['train_loss'].append(train_loss)
@@ -147,10 +157,10 @@ def train_one_cv_split(model, train_loader, val_loader, config, fold=None):
         # Log metrics to MLflow
         if mlflow.active_run():
             metrics = {
-                f"train_loss{fold_str}": train_loss,
-                f"train_acc{fold_str}": train_acc,
-                f"val_loss{fold_str}": val_loss,
-                f"val_acc{fold_str}": val_acc
+                f"train_loss{mlflow_fold_str}": train_loss,
+                f"train_acc{mlflow_fold_str}": train_acc,
+                f"val_loss{mlflow_fold_str}": val_loss,
+                f"val_acc{mlflow_fold_str}": val_acc
             }
             mlflow.log_metrics(metrics, step=epoch)
         
@@ -413,21 +423,47 @@ def main():
     """
     Main function to run the training process
     """
-    # Configuration
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Train audio classification model')
+    parser.add_argument('--config', type=str, help='Path to configuration JSON file')
+    parser.add_argument('--mode', type=str, default='cv', choices=['cv', 'final'],
+                        help='Training mode: cv (cross-validation) or final (final model)')
+    args = parser.parse_args()
+    
+    # Default configuration
     config = {
         'batch_size': 32,
-        'num_epochs': 1,  # Set to 1 for initial testing
+        'num_epochs': 5,
         'learning_rate': 0.001,
         'weight_decay': 1e-5,
         'use_lr_scheduler': True,
         'save_fold_models': False
     }
     
+    # Load configuration from file if provided
+    if args.config:
+        # Check if this is a relative path without directory prefix
+        config_path = args.config
+        if not os.path.dirname(args.config) and not os.path.isfile(args.config):
+            # Try to find it in the configs directory
+            configs_path = os.path.join('configs', args.config)
+            if os.path.isfile(configs_path):
+                config_path = configs_path
+        
+        try:
+            with open(config_path, 'r') as f:
+                loaded_config = json.load(f)
+                config.update(loaded_config)
+                print(f"Loaded configuration from {config_path}")
+                print(json.dumps(config, indent=2))
+        except Exception as e:
+            print(f"Error loading configuration: {e}")
+    
     # Data path
     data_path = 'data/preprocessed/esc50_preprocessed.npz'
     
     # Choose the mode
-    mode = 'cv'  # 'cv' for cross-validation, 'final' for final model training
+    mode = args.mode
     
     # Set up MLflow
     experiment_name = "esc50_audio_classification"
@@ -452,25 +488,27 @@ def main():
             _, cv_results = cross_validation(config, data_path)
             
             # Plot learning curves from cross-validation
-            plt.figure(figsize=(12, 5))
+            plt.figure(figsize=(15, 12))
             
-            plt.subplot(1, 2, 1)
+            # Create a grid of subplots - 2 metrics (loss, acc) × 4 folds
             for i, history in enumerate(cv_results['fold_histories']):
-                plt.plot(history['train_loss'], label=f'Fold {i+1} Train')
-                plt.plot(history['val_loss'], label=f'Fold {i+1} Val')
-            plt.title('Loss Curves')
-            plt.xlabel('Epoch')
-            plt.ylabel('Loss')
-            plt.legend()
-            
-            plt.subplot(1, 2, 2)
-            for i, history in enumerate(cv_results['fold_histories']):
-                plt.plot(history['train_acc'], label=f'Fold {i+1} Train')
-                plt.plot(history['val_acc'], label=f'Fold {i+1} Val')
-            plt.title('Accuracy Curves')
-            plt.xlabel('Epoch')
-            plt.ylabel('Accuracy')
-            plt.legend()
+                # Loss plot for this fold
+                plt.subplot(4, 2, i*2+1)
+                plt.plot(history['train_loss'], label=f'Training Loss')
+                plt.plot(history['val_loss'], label=f'Validation Loss')
+                plt.title(f'Fold {i+1} Loss Curves')
+                plt.xlabel('Epoch')
+                plt.ylabel('Loss')
+                plt.legend()
+                
+                # Accuracy plot for this fold
+                plt.subplot(4, 2, i*2+2)
+                plt.plot(history['train_acc'], label=f'Training Accuracy')
+                plt.plot(history['val_acc'], label=f'Validation Accuracy')
+                plt.title(f'Fold {i+1} Accuracy Curves')
+                plt.xlabel('Epoch')
+                plt.ylabel('Accuracy')
+                plt.legend()
             
             plt.tight_layout()
             os.makedirs('visualizations', exist_ok=True)
