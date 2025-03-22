@@ -40,16 +40,16 @@ class ResNet18ForAudio(nn.Module):
         Input shape:
             (batch_size, 1, 64, 501) - (batch, channels, mel_bins, time_frames)
         """
-        # Initial layers
-        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
+        # Initial layers with reduced channels
+        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(32)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         
-        # ResNet blocks
-        self.layer1 = self._make_layer(64, 64, 2, stride=1)
-        self.layer2 = self._make_layer(64, 128, 2, stride=2)
-        self.layer3 = self._make_layer(128, 256, 2, stride=2)
-        self.layer4 = self._make_layer(256, 512, 2, stride=2)
+        # ResNet blocks with reduced channels
+        self.layer1 = self._make_layer(32, 32, 2, stride=1)
+        self.layer2 = self._make_layer(32, 64, 2, stride=2)
+        self.layer3 = self._make_layer(64, 128, 2, stride=2)
+        self.layer4 = self._make_layer(128, 256, 2, stride=2)
         
         # Dropout for regularization
         self.dropout_rate = dropout_rate
@@ -57,7 +57,7 @@ class ResNet18ForAudio(nn.Module):
         
         # Global average pooling and final classifier
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512, num_classes)
+        self.fc = nn.Linear(256, num_classes)  # Reduced final dimension
         
         # Initialize weights
         self._initialize_weights()

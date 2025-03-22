@@ -508,6 +508,114 @@ def train_final_model(config, data_path, test_fold=5):
     
     return model, history, test_results
 
+def train_validation_model(config, data_path, test_fold=5):
+    """
+    Train model on all data except test fold and evaluate on validation fold.
+    This mode is useful for experimenting with full-length training without testing
+    on the held-out test set.
+    
+    Args:
+        config: Dictionary with training configuration
+        data_path: Path to preprocessed data
+        test_fold: Fold to reserve for final testing
+    
+    Returns:
+        model: Trained model
+        history: Training history
+    """
+    # Load data
+    data = np.load(data_path)
+    spectrograms = data['spectrograms']
+    labels = data['labels']
+    folds = data['folds']
+    
+    # Convert to torch tensors
+    spectrograms_tensor = torch.tensor(spectrograms, dtype=torch.float32).unsqueeze(1)
+    labels_tensor = torch.tensor(labels, dtype=torch.long)
+    
+    # Get augmentation settings from config
+    use_augmentation = config.get('use_augmentation', False)
+    aug_strength = config.get('aug_strength', 0.3)
+    
+    # Prepare dataset with optional augmentation
+    dataset = AugmentedDataset(
+        spectrograms_tensor, 
+        labels_tensor,
+        use_augmentation=use_augmentation,
+        aug_strength=aug_strength
+    )
+    
+    # Create train/validation split (exclude test fold from both)
+    # We'll use fold 4 as validation and folds 1,2,3 as training
+    validation_fold = 4  # Use fold 4 as validation
+    train_indices = np.where((folds != test_fold) & (folds != validation_fold))[0]
+    val_indices = np.where(folds == validation_fold)[0]
+    
+    # Create samplers
+    train_sampler = SubsetRandomSampler(train_indices)
+    val_sampler = SubsetRandomSampler(val_indices)
+    
+    # Create data loaders
+    train_loader = DataLoader(
+        dataset, batch_size=config['batch_size'], sampler=train_sampler
+    )
+    val_loader = DataLoader(
+        dataset, batch_size=config['batch_size'], sampler=val_sampler
+    )
+    
+    # Create model with optional dropout
+    dropout_rate = config.get('dropout_rate', 0.0)  # Default to 0 (no dropout)
+    model = create_resnet18(num_classes=len(np.unique(labels)), dropout_rate=dropout_rate)
+    
+    # Train the model
+    print("\n--- Training Validation Model ---")
+    model, history, val_acc = train_one_cv_split(model, train_loader, val_loader, config)
+    
+    print(f"\nValidation Results:")
+    print(f"Best Validation Accuracy: {val_acc:.4f}")
+    
+    # Save the model
+    os.makedirs('models/saved', exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_path = f'models/saved/validation_model_{timestamp}.pth'
+    torch.save(model.state_dict(), model_path)
+    print(f"Model saved to {model_path}")
+    
+    # Log model to MLflow
+    if mlflow.active_run():
+        mlflow.pytorch.log_model(model, "validation_model")
+        mlflow.log_artifact(model_path)
+    
+    # Plot learning curves
+    plt.figure(figsize=(12, 5))
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(history['train_loss'], label='Train Loss')
+    plt.plot(history['val_loss'], label='Validation Loss')
+    plt.title('Loss Curves')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(history['train_acc'], label='Train Accuracy')
+    plt.plot(history['val_acc'], label='Validation Accuracy')
+    plt.title('Accuracy Curves')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    
+    plt.tight_layout()
+    os.makedirs('visualizations', exist_ok=True)
+    curves_path = f'visualizations/validation_learning_curves_{timestamp}.png'
+    plt.savefig(curves_path)
+    
+    # Log the learning curves to MLflow
+    if mlflow.active_run():
+        mlflow.log_artifact(curves_path)
+    
+    return model, history
+
 def main():
     """
     Main function to run the training process
@@ -515,8 +623,8 @@ def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Train audio classification model')
     parser.add_argument('--config', type=str, help='Path to configuration JSON file')
-    parser.add_argument('--mode', type=str, default='cv', choices=['cv', 'final'],
-                        help='Training mode: cv (cross-validation) or final (final model)')
+    parser.add_argument('--mode', type=str, default='cv', choices=['cv', 'validation', 'final'],
+                        help='Training mode: cv (cross-validation), validation (train with val split), or final (final model)')
     args = parser.parse_args()
     
     # Default configuration
@@ -557,6 +665,8 @@ def main():
     # Set up MLflow with more specific experiment naming
     if args.mode == 'cv':
         experiment_name = "esc50_cross_validation"
+    elif args.mode == 'validation':
+        experiment_name = "esc50_validation_model"
     elif args.mode == 'final':
         experiment_name = "esc50_final_model"
     else:
@@ -618,6 +728,10 @@ def main():
             
             # Log the learning curves to MLflow
             mlflow.log_artifact(curves_path)
+            
+        elif mode == 'validation':
+            # Train validation model
+            model, history = train_validation_model(config, data_path)
             
         elif mode == 'final':
             # Train final model

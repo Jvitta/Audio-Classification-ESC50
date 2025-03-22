@@ -2,6 +2,7 @@
   "batch_size": 8,
   "weight_decay": 0.00012808487724517574,
   "use_lr_scheduler": true,
+  "learning_rate": 0.00018096,
   "scheduler_patience": 5,
   "scheduler_factor": 0.16363766870659915,
   "use_augmentation": false,
