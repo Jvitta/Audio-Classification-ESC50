@@ -498,6 +498,41 @@ def train_final_model(config, data_path, test_fold=5):
     if mlflow.active_run():
         mlflow.log_artifact(cm_path)
     
+    # Create binary confusion matrix (TP, TN, FP, FN)
+    # For multi-class, these are computed as sums across all classes
+    num_classes = len(np.unique(labels))
+    tp = np.sum(np.diag(cm))  # Sum of diagonal elements (correct predictions)
+    fn = np.sum(cm) - tp  # All actual positives minus true positives
+    fp = fn  # In a balanced multi-class problem, FP = FN (total incorrect predictions)
+    tn = num_classes * np.sum(cm) - (tp + fp + fn)  # All possible combinations minus others
+    
+    # Create a 2x2 binary confusion matrix
+    binary_cm = np.array([[tp, fp], [fn, tn]])
+    
+    # Plot binary confusion matrix
+    plt.figure(figsize=(8, 6))
+    plt.imshow(binary_cm, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.title('Binary Confusion Matrix (All Classes Combined)')
+    plt.colorbar()
+    
+    # Add text annotations
+    plt.text(0, 0, f"TP: {tp}", ha="center", va="center", color="white" if tp > np.sum(cm)/2 else "black")
+    plt.text(1, 0, f"FP: {fp}", ha="center", va="center", color="white" if fp > np.sum(cm)/2 else "black")
+    plt.text(0, 1, f"FN: {fn}", ha="center", va="center", color="white" if fn > np.sum(cm)/2 else "black")
+    plt.text(1, 1, f"TN: {tn}", ha="center", va="center", color="white" if tn > np.sum(cm)/2 else "black")
+    
+    # Set labels
+    plt.xticks([0, 1], ['Predicted Positive', 'Predicted Negative'])
+    plt.yticks([0, 1], ['Actual Positive', 'Actual Negative'])
+    
+    plt.tight_layout()
+    binary_cm_path = f'visualizations/binary_confusion_matrix_{timestamp}.png'
+    plt.savefig(binary_cm_path)
+    
+    # Log binary confusion matrix to MLflow
+    if mlflow.active_run():
+        mlflow.log_artifact(binary_cm_path)
+    
     # Save test results
     test_results = {
         'test_acc': test_acc,

@@ -3,8 +3,8 @@
   "learning_rate": 0.00018096,
   "weight_decay": 0.01,
   "use_lr_scheduler": true,
-  "scheduler_patience": 5,
-  "scheduler_factor": 0.3,
+  "scheduler_patience": 6,
+  "scheduler_factor": 0.5,
   "use_augmentation": false,
-  "num_epochs": 60
+  "num_epochs": 100
 } 
